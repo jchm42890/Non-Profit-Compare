@@ -6,6 +6,7 @@ import { X, Trash2, BarChart3, ArrowRight } from "lucide-react";
 import { useCompareStore } from "@/lib/compare/store";
 import { CompareTable } from "@/components/CompareTable";
 import { CompareCharts } from "@/components/CompareCharts";
+import { CompensationTable } from "@/components/CompensationTable";
 import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -143,6 +144,19 @@ export default function ComparePage() {
               <CompareCharts orgs={orgs} />
             </section>
           )}
+
+          {/* Schedule J Compensation per org */}
+          <section>
+            <h2 className="text-lg font-semibold mb-4">Executive Compensation (Schedule J)</h2>
+            <div className="space-y-6">
+              {orgs.map((org) => (
+                <div key={org.ein}>
+                  <p className="text-sm font-medium text-muted-foreground mb-2">{org.name}</p>
+                  <CompensationTable ein={org.ein} />
+                </div>
+              ))}
+            </div>
+          </section>
         </div>
       ) : null}
     </div>

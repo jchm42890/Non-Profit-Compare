@@ -4,6 +4,7 @@ import { MapPin, Globe, Calendar, Hash, Tag, ArrowLeft } from "lucide-react";
 import { dataProvider } from "@/lib/providers";
 import { KPIGrid } from "@/components/KPIGrid";
 import { TrendChart } from "@/components/TrendChart";
+import { CompensationTable } from "@/components/CompensationTable";
 import { SimilarNonprofitsPanel } from "@/components/SimilarNonprofitsPanel";
 import { LocalNonprofitsPanel } from "@/components/LocalNonprofitsPanel";
 import { AddToCompareButton } from "@/components/AddToCompareButton";
@@ -181,6 +182,12 @@ export default async function NonprofitPage({ params }: NonprofitPageProps) {
             </tbody>
           </table>
         </div>
+      </section>
+
+      {/* Compensation */}
+      <section className="mb-10">
+        <h2 className="text-lg font-semibold mb-4">Executive Compensation</h2>
+        <CompensationTable ein={org.ein} />
       </section>
 
       {/* Similar orgs */}
