@@ -3,11 +3,11 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  // DATABASE_URL should use the pooled connection (PgBouncer) in production.
-  // DIRECT_URL bypasses the pooler for migrations and introspection.
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "postgresql"
+  // At runtime only DATABASE_URL is needed.
+  // For local migrations set DIRECT_URL to the non-pooled URL and add:
+  //   directUrl = env("DIRECT_URL")
+  url      = env("DATABASE_URL")
 }
 
 model Organization {
