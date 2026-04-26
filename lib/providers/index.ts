@@ -1,105 +1,104 @@
-import type { NonprofitDataProvider } from "./types";
-import type { SearchResult } from "@/types";
-import { MockProvider } from "./mock-provider";
+import type { NonprofitDataProvider, SimilarityStrategy, LocationFilter } from "./types";
+import type { SearchFilters, SearchResult, OrganizationWithFilings, Organization, Filing, DerivedMetrics, SimilarOrganization } from "@/types";
 
-// Server-side provider selection — checked at runtime (not baked at build time).
-// Set DATA_PROVIDER in Vercel env vars:
-//   "propublica" → ProPublica API, 1.8M+ real nonprofits, no DB needed (default)
-//   "prisma"     → PostgreSQL via Prisma (requires DATABASE_URL + seeded DB)
-//   "mock"       → 14 built-in orgs, works offline
-//
-// NEXT_PUBLIC_DATA_PROVIDER is kept for legacy/client display only.
-function resolveProviderName(): string {
-  return (
+// Explicitly wraps every provider method so failures and empty results
+// on the primary gracefully retry on ProPublica.
+function withProPublicaFallback(
+  primary: NonprofitDataProvider,
+  fallback: NonprofitDataProvider
+): NonprofitDataProvider {
+  return {
+    async searchOrganizations(query: string, filters?: SearchFilters, page?: number, pageSize?: number): Promise<SearchResult> {
+      try {
+        const result = await primary.searchOrganizations(query, filters, page, pageSize);
+        // Empty DB — fall through to real data
+        if (result.organizations.length === 0 && query?.trim()) {
+          return fallback.searchOrganizations(query, filters, page, pageSize);
+        }
+        return result;
+      } catch {
+        return fallback.searchOrganizations(query, filters, page, pageSize);
+      }
+    },
+
+    async getOrganizationByEin(ein: string): Promise<OrganizationWithFilings | null> {
+      try {
+        const result = await primary.getOrganizationByEin(ein);
+        if (!result) return fallback.getOrganizationByEin(ein);
+        return result;
+      } catch {
+        return fallback.getOrganizationByEin(ein);
+      }
+    },
+
+    async getOrganizationFilings(ein: string): Promise<Filing[]> {
+      try {
+        const result = await primary.getOrganizationFilings(ein);
+        if (!result.length) return fallback.getOrganizationFilings(ein);
+        return result;
+      } catch {
+        return fallback.getOrganizationFilings(ein);
+      }
+    },
+
+    async getOrganizationMetrics(ein: string): Promise<DerivedMetrics[]> {
+      try {
+        return await primary.getOrganizationMetrics(ein);
+      } catch {
+        return fallback.getOrganizationMetrics(ein);
+      }
+    },
+
+    async getSimilarOrganizations(ein: string, strategy?: SimilarityStrategy, limit?: number): Promise<SimilarOrganization[]> {
+      try {
+        const result = await primary.getSimilarOrganizations(ein, strategy, limit);
+        if (!result.length) return fallback.getSimilarOrganizations(ein, strategy, limit);
+        return result;
+      } catch {
+        return fallback.getSimilarOrganizations(ein, strategy, limit);
+      }
+    },
+
+    async getLocalOrganizations(location: LocationFilter, filters?: Pick<SearchFilters, "nteeCode" | "nteeCategory">, limit?: number): Promise<Organization[]> {
+      try {
+        const result = await primary.getLocalOrganizations(location, filters, limit);
+        if (!result.length) return fallback.getLocalOrganizations(location, filters, limit);
+        return result;
+      } catch {
+        return fallback.getLocalOrganizations(location, filters, limit);
+      }
+    },
+  };
+}
+
+function buildProvider(): NonprofitDataProvider {
+  const { ProPublicaProvider } = require("./propublica-provider");
+  const propublica: NonprofitDataProvider = new ProPublicaProvider();
+
+  // Use DATA_PROVIDER (runtime) or fall back to NEXT_PUBLIC_ (may be build-baked)
+  const name =
     process.env.DATA_PROVIDER ??
     process.env.NEXT_PUBLIC_DATA_PROVIDER ??
-    "propublica"
-  );
-}
-
-function buildPrismaProvider(): NonprofitDataProvider | null {
-  try {
-    const { PrismaProvider } = require("./prisma-provider");
-    return new PrismaProvider();
-  } catch {
-    return null;
-  }
-}
-
-function buildProPublicaProvider(): NonprofitDataProvider {
-  const { ProPublicaProvider } = require("./propublica-provider");
-  return new ProPublicaProvider();
-}
-
-// Wraps a primary provider so that:
-//  - any thrown error falls back to ProPublica
-//  - empty search results (when a query was given) also fall back to ProPublica
-function withProPublicaFallback(
-  primary: NonprofitDataProvider
-): NonprofitDataProvider {
-  const fallback = buildProPublicaProvider();
-
-  return new Proxy(primary, {
-    get(target, prop: string) {
-      const orig = (target as unknown as Record<string, unknown>)[prop];
-      if (typeof orig !== "function") return orig;
-
-      return async (...args: unknown[]) => {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const result = await (orig as any).apply(target, args);
-
-          // For searches: fall back when DB returned nothing for a non-empty query
-          if (
-            prop === "searchOrganizations" &&
-            (result as SearchResult).organizations?.length === 0 &&
-            args[0] &&
-            String(args[0]).trim().length > 0
-          ) {
-            console.warn(
-              "[provider] Prisma returned 0 results — trying ProPublica"
-            );
-            const fb = (fallback as unknown as Record<string, unknown>)[prop];
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return (fb as any).apply(fallback, args);
-          }
-
-          return result;
-        } catch (err) {
-          console.error(`[provider] ${prop} failed on Prisma:`, err);
-          const fb = (fallback as unknown as Record<string, unknown>)[prop];
-          if (typeof fb === "function") {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return (fb as any).apply(fallback, args);
-          }
-          throw err;
-        }
-      };
-    },
-  });
-}
-
-function createProvider(): NonprofitDataProvider {
-  const name = resolveProviderName();
+    "propublica";
 
   if (name === "mock") {
+    const { MockProvider } = require("./mock-provider");
     return new MockProvider();
   }
 
-  if (name === "prisma") {
-    const prisma = buildPrismaProvider();
-    if (prisma) return withProPublicaFallback(prisma);
-    console.warn("[provider] Prisma failed to load — falling back to ProPublica");
+  if (name === "prisma" && process.env.DATABASE_URL) {
+    try {
+      const { PrismaProvider } = require("./prisma-provider");
+      const prisma: NonprofitDataProvider = new PrismaProvider();
+      // Wrap so empty/erroring Prisma results fall back to ProPublica
+      return withProPublicaFallback(prisma, propublica);
+    } catch (e) {
+      console.error("[provider] Prisma failed to initialise:", e);
+    }
   }
 
-  if (name === "propublica" || name === "prisma") {
-    return buildProPublicaProvider();
-  }
-
-  // Unknown value — default to ProPublica
-  console.warn(`[provider] Unknown DATA_PROVIDER "${name}" — using ProPublica`);
-  return buildProPublicaProvider();
+  return propublica;
 }
 
-export const dataProvider: NonprofitDataProvider = createProvider();
+export const dataProvider: NonprofitDataProvider = buildProvider();
 export type { NonprofitDataProvider } from "./types";
