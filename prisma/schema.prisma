@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id          String   @id @default(cuid())
+  ein         String   @unique
+  name        String
+  city        String
+  state       String
+  zip         String?
+  nteeCode    String
+  nteeCategory String
+  mission     String?
+  website     String?
+  ruling      Int?     // year IRS ruling granted
+  subsection  String?  // 501(c)(3), etc.
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  filings        Filing[]
+  derivedMetrics DerivedMetrics[]
+
+  @@index([state])
+  @@index([nteeCode])
+  @@index([city, state])
+}
+
+model Filing {
+  id                     String   @id @default(cuid())
+  organizationId         String
+  ein                    String
+  taxYear                Int
+  filedAt                DateTime?
+
+  // Income Statement
+  totalRevenue           Float?
+  totalExpenses          Float?
+  netIncome              Float?
+  totalContributions     Float?
+  programServiceRevenue  Float?
+  investmentIncome       Float?
+  otherRevenue           Float?
+
+  // Balance Sheet
+  totalAssets            Float?
+  totalLiabilities       Float?
+  netAssets              Float?
+
+  // Expenses breakdown
+  programExpenses        Float?
+  adminExpenses          Float?
+  fundraisingExpenses    Float?
+
+  // Compensation
+  executiveCompensation  Float?
+  employeeCount          Int?
+
+  // Grants
+  totalGrants            Float?
+
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  organization           Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([ein, taxYear])
+  @@index([ein])
+  @@index([taxYear])
+}
+
+model DerivedMetrics {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  ein                   String
+  taxYear               Int
+
+  programExpenseRatio   Float?   // programExpenses / totalExpenses
+  adminRatio            Float?   // adminExpenses / totalExpenses
+  fundraisingRatio      Float?   // fundraisingExpenses / totalExpenses
+  revenueGrowthYoY      Float?   // (currentRevenue - priorRevenue) / |priorRevenue|
+  assetGrowthYoY        Float?   // (currentAssets - priorAssets) / |priorAssets|
+  netMargin             Float?   // netIncome / totalRevenue
+  liquidityRatio        Float?   // netAssets / totalExpenses (months of reserves)
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([ein, taxYear])
+  @@index([ein])
+}
