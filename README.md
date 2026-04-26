@@ -23,6 +23,36 @@ Nonprofit Compare lets you:
 | State | Zustand (localStorage-persisted) |
 | Database | PostgreSQL + Prisma ORM |
 
+## Deploy to Vercel
+
+### Option A — Mock data (zero config, instant)
+
+Click **Deploy** in the Vercel dashboard, import the repo, and deploy.  
+No environment variables needed — the app ships with 14 built-in nonprofits.
+
+### Option B — With Vercel Postgres (production data)
+
+1. In your Vercel project → **Storage** → **Create Database** → **Postgres**
+2. Vercel automatically adds these environment variables to your project:
+   - `DATABASE_URL` — pooled connection (used by the app)
+   - `POSTGRES_URL_NON_POOLING` — direct connection (used for migrations)
+3. In Vercel project settings → **Environment Variables**, add:
+   ```
+   DIRECT_URL = <value of POSTGRES_URL_NON_POOLING>
+   NEXT_PUBLIC_DATA_PROVIDER = prisma
+   ```
+4. Redeploy, then run the seed from your local machine:
+   ```bash
+   # Pull the Vercel env vars locally
+   npx vercel env pull .env.local
+
+   # Run migrations and seed
+   npm run db:migrate:deploy
+   npm run db:seed
+   ```
+
+---
+
 ## Quick Start
 
 ### 1. Clone and install

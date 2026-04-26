@@ -1,19 +1,26 @@
 import type { NonprofitDataProvider } from "./types";
 import { MockProvider } from "./mock-provider";
 
-// Switch provider via NEXT_PUBLIC_DATA_PROVIDER env var.
-// Supported values: "mock" (default) | "propublica" | "irs"
+// Provider selection order:
+//  1. NEXT_PUBLIC_DATA_PROVIDER env var ("mock" | "prisma" | "propublica")
+//  2. Auto-detect: if DATABASE_URL is set, use prisma; otherwise mock
 function createProvider(): NonprofitDataProvider {
-  const name = process.env.NEXT_PUBLIC_DATA_PROVIDER ?? "mock";
-  switch (name) {
-    case "mock":
-      return new MockProvider();
-    // Placeholder — swap in a real ProPublicaProvider here:
-    // case "propublica":
-    //   return new ProPublicaProvider();
-    default:
-      return new MockProvider();
+  const explicit = process.env.NEXT_PUBLIC_DATA_PROVIDER;
+
+  if (explicit === "prisma" || (!explicit && process.env.DATABASE_URL)) {
+    // Dynamic import keeps Prisma out of the client bundle
+    const { PrismaProvider } = require("./prisma-provider");
+    return new PrismaProvider();
   }
+
+  if (explicit === "propublica") {
+    // Swap in a real ProPublicaProvider here when ready:
+    // const { ProPublicaProvider } = require("./propublica-provider");
+    // return new ProPublicaProvider();
+    console.warn("ProPublica provider not yet implemented; falling back to mock");
+  }
+
+  return new MockProvider();
 }
 
 export const dataProvider: NonprofitDataProvider = createProvider();

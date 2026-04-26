@@ -1,6 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import { computeAllMetrics } from "../lib/metrics/derived-metrics";
 
+// Use a direct PrismaClient in the seed script (not the singleton)
+// so it connects via DIRECT_URL and doesn't conflict with the app process.
 const prisma = new PrismaClient();
 
 const ORGS = [
