@@ -24,6 +24,16 @@ function xmlUrlFromPdf(pdfUrl: string): string | null {
 
 function extractObjectId(f: PPFiling): string | null {
   if (f.object_id && /^\d{14,}$/.test(f.object_id)) return f.object_id;
+  // Try to extract from pdf_url path (e.g. ?path=...%2F202312169349303_public.pdf)
+  if (f.pdf_url) {
+    try {
+      const u = new URL(f.pdf_url);
+      const path = decodeURIComponent(u.searchParams.get("path") ?? "");
+      const filename = path.split("/").pop() ?? "";
+      const m = filename.match(/^(\d{14,})/);
+      if (m) return m[1];
+    } catch {}
+  }
   return null;
 }
 
@@ -78,7 +88,15 @@ async function resolveScheduleJ(
     if (xmlUrl) {
       let xmlStatus = "error";
       try {
-        const res = await fetch(xmlUrl, { cache: "no-store" });
+        const res = await fetch(xmlUrl, {
+          cache: "no-store",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/xml, text/xml, */*",
+            "Referer": "https://projects.propublica.org/nonprofits/",
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+        });
         xmlStatus = `HTTP ${res.status}`;
         if (res.ok) {
           const xml = await res.text();

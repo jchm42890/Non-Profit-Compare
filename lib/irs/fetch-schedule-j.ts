@@ -145,7 +145,10 @@ async function tryFetchXml(objectId: string): Promise<string | null> {
     try {
       const res = await fetch(url, {
         next: { revalidate: 86400 },
-        headers: { Accept: "application/xml, text/xml, */*" },
+        headers: {
+          Accept: "application/xml, text/xml, */*",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        },
       });
       if (res.ok) return res.text();
     } catch {}
