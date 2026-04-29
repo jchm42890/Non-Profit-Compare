@@ -3,7 +3,52 @@ import { fetchScheduleJ } from "@/lib/irs/fetch-schedule-j";
 
 export const dynamic = "force-dynamic";
 
-// ProPublica filing detail includes object_id for each year's 990 XML
+interface PPFiling {
+  tax_prd_yr: string | number;
+  object_id?: string;
+  pdf_url?: string;
+}
+
+// Extract IRS S3 object_id from ProPublica's pdf_url when the field is missing.
+// pdf_url path looks like: IRS/954016653_202306_990_2024042322369843.pdf
+// The last numeric segment is the IRS object_id.
+function objectIdFromPdfUrl(pdfUrl: string): string | null {
+  try {
+    const decoded = decodeURIComponent(new URL(pdfUrl).searchParams.get("path") ?? "");
+    const filename = decoded.split("/").pop()?.replace(".pdf", "") ?? "";
+    const segments = filename.split("_");
+    // Object id is the last segment
+    const candidate = segments[segments.length - 1];
+    if (/^\d{10,}$/.test(candidate)) return candidate;
+  } catch {}
+  return null;
+}
+
+// Fallback: query IRS EFTS full-text search for the object_id by EIN + tax year
+async function lookupObjectIdFromEfts(
+  ein: string,
+  taxYear: number
+): Promise<string | null> {
+  try {
+    const start = `${taxYear}-01-01`;
+    const end = `${taxYear + 2}-12-31`;
+    const url = `https://efts.irs.gov/LATEST/search-index?q=%22${ein}%22&dateRange=custom&startDate=${start}&endDate=${end}&forms=990,990EZ,990PF`;
+    const res = await fetch(url, {
+      next: { revalidate: 86400 },
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as { hits?: { hits?: { _id: string; _source?: { TaxPeriod?: string } }[] } };
+    const hits = data?.hits?.hits ?? [];
+    // Match the correct tax period (YYYYMM)
+    const taxPeriodPrefix = String(taxYear);
+    const match = hits.find((h) => h._source?.TaxPeriod?.startsWith(taxPeriodPrefix));
+    return match?._id ?? hits[0]?._id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function getFilingObjectIds(
   ein: string
 ): Promise<{ taxYear: number; objectId: string }[]> {
@@ -15,20 +60,38 @@ async function getFilingObjectIds(
   const res = await fetch(`${base}/organizations/${normalized}.json`, {
     next: { revalidate: 3600 },
   });
-
   if (!res.ok) return [];
 
-  const data = (await res.json()) as {
-    filings_with_data?: { tax_prd_yr: string; object_id: string }[];
-  };
+  const data = (await res.json()) as { filings_with_data?: PPFiling[] };
+  const filings = (data.filings_with_data ?? []).slice(0, 5);
 
-  return (data.filings_with_data ?? [])
-    .filter((f) => f.object_id)
-    .slice(0, 5) // latest 5 years
-    .map((f) => ({
-      taxYear: parseInt(f.tax_prd_yr, 10),
-      objectId: f.object_id,
-    }));
+  const results: { taxYear: number; objectId: string }[] = [];
+
+  for (const f of filings) {
+    const taxYear = parseInt(String(f.tax_prd_yr), 10);
+    if (isNaN(taxYear)) continue;
+
+    // 1. Use object_id directly if present
+    if (f.object_id && /^\d+$/.test(f.object_id)) {
+      results.push({ taxYear, objectId: f.object_id });
+      continue;
+    }
+
+    // 2. Extract from pdf_url
+    const fromPdf = f.pdf_url ? objectIdFromPdfUrl(f.pdf_url) : null;
+    if (fromPdf) {
+      results.push({ taxYear, objectId: fromPdf });
+      continue;
+    }
+
+    // 3. Query IRS EFTS as last resort
+    const fromEfts = await lookupObjectIdFromEfts(normalized, taxYear);
+    if (fromEfts) {
+      results.push({ taxYear, objectId: fromEfts });
+    }
+  }
+
+  return results;
 }
 
 export async function GET(
@@ -44,7 +107,6 @@ export async function GET(
       return NextResponse.json({ ein, years: [] });
     }
 
-    // Fetch Schedule J for each year in parallel (capped at 3)
     const results = await Promise.all(
       filings.slice(0, 3).map((f) => fetchScheduleJ(f.objectId, f.taxYear))
     );
@@ -55,9 +117,6 @@ export async function GET(
 
     return NextResponse.json({ ein, years });
   } catch (err) {
-    return NextResponse.json(
-      { error: String(err) },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: String(err) }, { status: 500 });
   }
 }
