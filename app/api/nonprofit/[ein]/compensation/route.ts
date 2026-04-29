@@ -24,14 +24,17 @@ function xmlUrlFromPdf(pdfUrl: string): string | null {
 
 function extractObjectId(f: PPFiling): string | null {
   if (f.object_id && /^\d{14,}$/.test(f.object_id)) return f.object_id;
-  // Try to extract from pdf_url path (e.g. ?path=...%2F202312169349303_public.pdf)
+  // ProPublica path: "IRS/954016653_202306_990_2024042322369843.pdf"
+  // The IRS object ID is the last underscore-segment before the extension
   if (f.pdf_url) {
     try {
       const u = new URL(f.pdf_url);
       const path = decodeURIComponent(u.searchParams.get("path") ?? "");
-      const filename = path.split("/").pop() ?? "";
-      const m = filename.match(/^(\d{14,})/);
-      if (m) return m[1];
+      const filename = (path.split("/").pop() ?? "").replace(/\.(pdf|xml)$/i, "");
+      const segments = filename.split("_");
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (/^\d{14,}$/.test(segments[i])) return segments[i];
+      }
     } catch {}
   }
   return null;
@@ -81,31 +84,30 @@ async function resolveScheduleJ(
     log.s1_s3_xml = "no objectId";
   }
 
-  // Strategy 2: ProPublica XML URL
+  // Strategy 2: IRS S3 XML via full-path filename (ProPublica proxy always 403 server-side)
+  // ProPublica path encodes the full filename; try it as a bare S3 key too
   if (f.pdf_url) {
     const xmlUrl = xmlUrlFromPdf(f.pdf_url);
     log.s2_url = xmlUrl;
     if (xmlUrl) {
-      let xmlStatus = "error";
+      // Extract the bare filename from the path and try IRS S3 directly
       try {
-        const res = await fetch(xmlUrl, {
-          cache: "no-store",
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "application/xml, text/xml, */*",
-            "Referer": "https://projects.propublica.org/nonprofits/",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
-        });
-        xmlStatus = `HTTP ${res.status}`;
-        if (res.ok) {
-          const xml = await res.text();
-          log.s2_pp_xml = `fetched (${xml.length} chars)`;
-          const r = await fetchScheduleJFromXmlUrl(xmlUrl, taxYear);
-          log.s2_pp_xml += r ? ` → ${r.records.length} records` : " → 0 records parsed";
-          if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
-        } else {
-          log.s2_pp_xml = xmlStatus;
+        const u = new URL(xmlUrl);
+        const path = decodeURIComponent(u.searchParams.get("path") ?? "");
+        const filename = path.split("/").pop() ?? "";
+        if (filename.endsWith(".xml")) {
+          const directS3 = `https://s3.amazonaws.com/irs-form-990/${filename}`;
+          const res = await fetch(directS3, {
+            next: { revalidate: 86400 },
+            headers: { Accept: "application/xml, text/xml, */*" },
+          });
+          log.s2_pp_xml = `direct-S3 HTTP ${res.status}`;
+          if (res.ok) {
+            const xml = await res.text();
+            const r = await fetchScheduleJFromXmlUrl(directS3, taxYear);
+            log.s2_pp_xml += r ? ` → ${r.records.length} records` : " → 0 parsed";
+            if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
+          }
         }
       } catch (e) {
         log.s2_pp_xml = `error: ${String(e).slice(0, 80)}`;
@@ -113,8 +115,8 @@ async function resolveScheduleJ(
     }
   }
 
-  // Strategy 3: PDF parsing
-  if (f.pdf_url) {
+  // Strategy 3: PDF text parsing (only viable if pdf_url is not a ProPublica proxy)
+  if (f.pdf_url && !f.pdf_url.includes("projects.propublica.org")) {
     try {
       const records = await extractOfficersFromPdf(f.pdf_url);
       log.s3_pdf = `parsed (${records.length} records)`;
@@ -126,6 +128,8 @@ async function resolveScheduleJ(
     } catch (e) {
       log.s3_pdf = `error: ${String(e).slice(0, 120)}`;
     }
+  } else if (f.pdf_url) {
+    log.s3_pdf = "skipped (ProPublica proxy 403)";
   }
 
   return { result: null, log };
