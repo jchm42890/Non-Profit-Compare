@@ -7,91 +7,26 @@ interface PPFiling {
   tax_prd_yr: string | number;
   object_id?: string;
   pdf_url?: string;
+  compnsatncurrofcr?: number; // total officer comp from Part IX (always present)
 }
 
-// Extract IRS S3 object_id from ProPublica's pdf_url when the field is missing.
-// pdf_url path looks like: IRS/954016653_202306_990_2024042322369843.pdf
-// The last numeric segment is the IRS object_id.
-function objectIdFromPdfUrl(pdfUrl: string): string | null {
-  try {
-    const decoded = decodeURIComponent(new URL(pdfUrl).searchParams.get("path") ?? "");
-    const filename = decoded.split("/").pop()?.replace(".pdf", "") ?? "";
-    const segments = filename.split("_");
-    // Object id is the last segment
-    const candidate = segments[segments.length - 1];
-    if (/^\d{10,}$/.test(candidate)) return candidate;
-  } catch {}
+function extractObjectId(f: PPFiling): string | null {
+  // Direct object_id (present for filings in the IRS S3 dataset, typically pre-2023)
+  if (f.object_id && /^\d{14,}$/.test(f.object_id)) return f.object_id;
   return null;
 }
 
-// Fallback: query IRS EFTS full-text search for the object_id by EIN + tax year
-async function lookupObjectIdFromEfts(
-  ein: string,
-  taxYear: number
-): Promise<string | null> {
-  try {
-    const start = `${taxYear}-01-01`;
-    const end = `${taxYear + 2}-12-31`;
-    const url = `https://efts.irs.gov/LATEST/search-index?q=%22${ein}%22&dateRange=custom&startDate=${start}&endDate=${end}&forms=990,990EZ,990PF`;
-    const res = await fetch(url, {
-      next: { revalidate: 86400 },
-      headers: { Accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const data = await res.json() as { hits?: { hits?: { _id: string; _source?: { TaxPeriod?: string } }[] } };
-    const hits = data?.hits?.hits ?? [];
-    // Match the correct tax period (YYYYMM)
-    const taxPeriodPrefix = String(taxYear);
-    const match = hits.find((h) => h._source?.TaxPeriod?.startsWith(taxPeriodPrefix));
-    return match?._id ?? hits[0]?._id ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function getFilingObjectIds(
-  ein: string
-): Promise<{ taxYear: number; objectId: string }[]> {
+async function getPPFilings(ein: string): Promise<PPFiling[]> {
   const normalized = ein.replace(/-/g, "");
   const base =
     process.env.PROPUBLICA_API_BASE ??
     "https://projects.propublica.org/nonprofits/api/v2";
-
   const res = await fetch(`${base}/organizations/${normalized}.json`, {
     next: { revalidate: 3600 },
   });
   if (!res.ok) return [];
-
-  const data = (await res.json()) as { filings_with_data?: PPFiling[] };
-  const filings = (data.filings_with_data ?? []).slice(0, 5);
-
-  const results: { taxYear: number; objectId: string }[] = [];
-
-  for (const f of filings) {
-    const taxYear = parseInt(String(f.tax_prd_yr), 10);
-    if (isNaN(taxYear)) continue;
-
-    // 1. Use object_id directly if present
-    if (f.object_id && /^\d+$/.test(f.object_id)) {
-      results.push({ taxYear, objectId: f.object_id });
-      continue;
-    }
-
-    // 2. Extract from pdf_url
-    const fromPdf = f.pdf_url ? objectIdFromPdfUrl(f.pdf_url) : null;
-    if (fromPdf) {
-      results.push({ taxYear, objectId: fromPdf });
-      continue;
-    }
-
-    // 3. Query IRS EFTS as last resort
-    const fromEfts = await lookupObjectIdFromEfts(normalized, taxYear);
-    if (fromEfts) {
-      results.push({ taxYear, objectId: fromEfts });
-    }
-  }
-
-  return results;
+  const data = await res.json() as { filings_with_data?: PPFiling[] };
+  return data.filings_with_data ?? [];
 }
 
 export async function GET(
@@ -101,21 +36,54 @@ export async function GET(
   const { ein } = params;
 
   try {
-    const filings = await getFilingObjectIds(ein);
+    const filings = await getPPFilings(ein);
 
-    if (!filings.length) {
-      return NextResponse.json({ ein, years: [] });
-    }
+    // Aggregate summary rows (always available from ProPublica)
+    const summary = filings
+      .filter((f) => f.compnsatncurrofcr != null)
+      .slice(0, 5)
+      .map((f) => ({
+        taxYear: parseInt(String(f.tax_prd_yr), 10),
+        totalOfficerComp: f.compnsatncurrofcr ?? 0,
+        pdfUrl: f.pdf_url ?? null,
+        hasXml: false,
+      }));
 
-    const results = await Promise.all(
-      filings.slice(0, 3).map((f) => fetchScheduleJ(f.objectId, f.taxYear))
+    // Try Schedule J XML for filings that have an object_id
+    // (IRS S3 dataset typically covers filings through ~2 years ago)
+    const xmlResults = await Promise.all(
+      filings
+        .slice(0, 5)
+        .map(async (f) => {
+          const objectId = extractObjectId(f);
+          if (!objectId) return null;
+          const taxYear = parseInt(String(f.tax_prd_yr), 10);
+          return fetchScheduleJ(objectId, taxYear);
+        })
     );
 
-    const years = results
+    // Merge XML results into summary
+    for (const xmlResult of xmlResults) {
+      if (!xmlResult || !xmlResult.records.length) continue;
+      const row = summary.find((s) => s.taxYear === xmlResult.taxYear);
+      if (row) row.hasXml = true;
+    }
+
+    const scheduleJYears = xmlResults
       .filter((r): r is NonNullable<typeof r> => r !== null && r.records.length > 0)
       .sort((a, b) => b.taxYear - a.taxYear);
 
-    return NextResponse.json({ ein, years });
+    return NextResponse.json({
+      ein,
+      // Detailed Schedule J breakdown when XML is available
+      years: scheduleJYears,
+      // Aggregate totals for all years (always populated from ProPublica)
+      summary,
+      xmlAvailable: scheduleJYears.length > 0,
+      note: scheduleJYears.length === 0
+        ? "IRS 990 XML files for recent filings (typically within 1-2 years) are not yet published to the public dataset. Aggregate totals are shown from ProPublica. Click 'View PDF' to see full Schedule J."
+        : null,
+    });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
