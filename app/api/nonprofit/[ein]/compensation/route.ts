@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
-import { fetchScheduleJ, fetchScheduleJFromXmlUrl, type ScheduleJResult } from "@/lib/irs/fetch-schedule-j";
-import { extractOfficersFromPdf } from "@/lib/irs/parse-990-pdf";
+import { fetchScheduleJFromXmlUrl, type ScheduleJResult } from "@/lib/irs/fetch-schedule-j";
 
 export const dynamic = "force-dynamic";
+
+const S3_BASE = "https://s3.amazonaws.com/irs-form-990";
 
 interface PPFiling {
   tax_prd_yr: string | number;
@@ -10,219 +11,125 @@ interface PPFiling {
   pdf_url?: string;
 }
 
-interface EFTSResult {
-  objectId: string | null;
-  detail: string;
-}
-
-// IRS EFTS full-text search — returns the real IRS objectId plus a detail string
-// so callers can log exactly what happened.
-async function findObjectIdViaEFTS(ein: string, taxYear: number): Promise<EFTSResult> {
-  const normalized = ein.replace(/-/g, "");
-
-  // Try two queries: broad (no date filter), then year-scoped
-  const urls = [
-    // Broad: all filings for this EIN
-    `https://efts.irs.gov/LATEST/search-engines/irs_990_search_engine_data/search?q=&ein=${normalized}`,
-    // Year-scoped
-    `https://efts.irs.gov/LATEST/search-engines/irs_990_search_engine_data/search?q=&ein=${normalized}&dateRange=custom&startDate=${taxYear - 1}-01-01&endDate=${taxYear + 1}-12-31`,
-  ];
-
-  for (const url of urls) {
-    try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(8000),
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; nonprofit-research/1.0)",
-          "Accept": "application/json",
-        },
-      });
-      if (!res.ok) return { objectId: null, detail: `HTTP ${res.status}` };
-
-      let data: Record<string, unknown>;
-      try {
-        data = (await res.json()) as Record<string, unknown>;
-      } catch (e) {
-        return { objectId: null, detail: `bad JSON: ${String(e).slice(0, 60)}` };
-      }
-
-      const hitsWrapper = data.hits as Record<string, unknown> | undefined;
-      const total = (hitsWrapper?.total as Record<string, unknown>)?.value ?? hitsWrapper?.total ?? 0;
-      const hits = (hitsWrapper?.hits as unknown[]) ?? [];
-
-      if (!hits.length) {
-        return { objectId: null, detail: `0 hits (total=${total})` };
-      }
-
-      for (const h of hits) {
-        const hit = h as Record<string, unknown>;
-        const src = (hit._source as Record<string, unknown>) ?? {};
-        const id = String(src.ObjectId ?? src.object_id ?? hit._id ?? "");
-        if (/^\d{14,}$/.test(id)) {
-          return { objectId: id, detail: `hit _id=${hit._id} src.TaxPeriod=${src.TaxPeriod}` };
-        }
-      }
-
-      // Hits exist but no valid objectId — log keys so we can fix field name
-      const firstSrc = ((hits[0] as Record<string, unknown>)._source as Record<string, unknown>) ?? {};
-      return { objectId: null, detail: `${hits.length} hits no ID; keys=${Object.keys(firstSrc).slice(0, 8).join(",")}` };
-
-    } catch (e) {
-      const msg = String(e);
-      if (msg.includes("TimeoutError") || msg.includes("AbortError")) {
-        return { objectId: null, detail: "timeout (8s)" };
-      }
-      return { objectId: null, detail: `fetch error: ${msg.slice(0, 80)}` };
-    }
-  }
-  return { objectId: null, detail: "no attempts made" };
-}
-
-// IRS apps.irs.gov Tax Exempt Organization Search — alternative objectId source
-async function findObjectIdViaIRSTEOS(ein: string): Promise<EFTSResult> {
-  try {
-    const normalized = ein.replace(/-/g, "");
-    const url = `https://apps.irs.gov/app/eos/api?action=getFilings&ein=${normalized}`;
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(6000),
-      headers: { "Accept": "application/json" },
-    });
-    if (!res.ok) return { objectId: null, detail: `TEOS HTTP ${res.status}` };
-    const data = (await res.json()) as Record<string, unknown>;
-    // Look for any field that resembles an objectId
-    const filings = (data.filings as unknown[]) ?? (data.data as unknown[]) ?? [];
-    for (const f of filings) {
-      const filing = f as Record<string, unknown>;
-      const id = String(filing.objectId ?? filing.ObjectId ?? filing.object_id ?? "");
-      if (/^\d{14,}$/.test(id)) return { objectId: id, detail: `TEOS found: ${id}` };
-    }
-    return { objectId: null, detail: `TEOS 0 usable; keys=${Object.keys(data).slice(0, 6).join(",")}` };
-  } catch (e) {
-    return { objectId: null, detail: `TEOS error: ${String(e).slice(0, 60)}` };
-  }
-}
-
 async function getPPFilings(ein: string): Promise<PPFiling[]> {
   const normalized = ein.replace(/-/g, "");
-  const base = process.env.PROPUBLICA_API_BASE ?? "https://projects.propublica.org/nonprofits/api/v2";
-  const res = await fetch(`${base}/organizations/${normalized}.json`, { next: { revalidate: 3600 } });
+  const base =
+    process.env.PROPUBLICA_API_BASE ??
+    "https://projects.propublica.org/nonprofits/api/v2";
+  const res = await fetch(`${base}/organizations/${normalized}.json`, {
+    next: { revalidate: 3600 },
+  });
   if (!res.ok) return [];
   const data = (await res.json()) as { filings_with_data?: PPFiling[] };
   return data.filings_with_data ?? [];
 }
 
+// Build every plausible IRS S3 URL from a ProPublica pdf_url.
+// ProPublica's path parameter encodes where they stored the filing:
+//   - "IRS/954016653_202306_990_2024042322369843.xml"   (newer: may be in IRS S3 root or IRS/ prefix)
+//   - "04_2021_prefixes_95-99/954016653_202006_990_2021040617897708.xml"  (older: ProPublica batch)
+// We try: full path as S3 key, filename-only as S3 key, _public.xml variants, and
+// the ProPublica objectId format {YYYYMMDD}{8-digit-seq}_public.xml.
+function buildS3Candidates(pdfUrl: string): string[] {
+  const candidates: string[] = [];
+  try {
+    const u = new URL(pdfUrl);
+    const rawPath = decodeURIComponent(u.searchParams.get("path") ?? "");
+    // Normalise to .xml (could be .pdf)
+    const xmlPath = rawPath.replace(/\.pdf$/i, ".xml");
+    const filename = xmlPath.split("/").pop() ?? "";
+
+    if (!filename) return candidates;
+
+    // Full ProPublica path as S3 key (works if IRS S3 mirrors this structure)
+    candidates.push(`${S3_BASE}/${xmlPath}`);
+    candidates.push(`${S3_BASE}/${xmlPath.replace(/\.xml$/, "_public.xml")}`);
+
+    // Filename-only (no subdirectory)
+    candidates.push(`${S3_BASE}/${filename}`);
+    candidates.push(`${S3_BASE}/${filename.replace(/\.xml$/, "_public.xml")}`);
+
+    // ProPublica's internal ID is the last _-segment: e.g. "2024042322369843"
+    // The IRS objectId for the same filing starts with the same date (YYYYMMDD)
+    // but may differ in the trailing sequence. Try common IRS sequence suffixes:
+    const nameNoExt = filename.replace(/\.xml$/, "");
+    const segments = nameNoExt.split("_");
+    const ppId = segments[segments.length - 1]; // e.g. "2024042322369843"
+    if (/^\d{16}$/.test(ppId)) {
+      // IRS objectIds we've seen are 15 digits: YYYYMMDD + 7 digits
+      // ProPublica's are 16 digits: YYYYMMDD + 8 digits
+      // Try dropping the 9th digit (index 8) — first digit of the sequence
+      const datepart = ppId.slice(0, 8); // "20240423"
+      const seq8 = ppId.slice(8);        // "22369843"
+      // Common IRS sequences seen in public data end with 9349303
+      for (const suffix of ["9349303", "0000001", seq8.slice(1)]) {
+        candidates.push(`${S3_BASE}/${datepart}${suffix}_public.xml`);
+      }
+    }
+  } catch {}
+  return candidates;
+}
+
 interface StrategyLog {
   taxYear: number;
-  s0_efts: string;
-  s0b_teos: string;
-  s1_s3_xml: string;
-  s2_pp_redirect: string;
-  s2_url: string | null;
-  s3_pdf: string;
+  ppObjectId: string;
+  s3Attempts: { url: string; status: string }[];
   result: "found" | "none";
   recordCount: number;
 }
 
-function xmlUrlFromPdf(pdfUrl: string): string | null {
-  try {
-    const u = new URL(pdfUrl);
-    const path = decodeURIComponent(u.searchParams.get("path") ?? "");
-    if (!path.endsWith(".pdf")) return null;
-    u.searchParams.set("path", path.replace(/\.pdf$/, ".xml"));
-    return u.toString();
-  } catch {
-    return null;
-  }
-}
-
 async function resolveScheduleJ(
   f: PPFiling,
-  ein: string,
   debug: boolean
 ): Promise<{ result: ScheduleJResult | null; log: StrategyLog }> {
   const taxYear = parseInt(String(f.tax_prd_yr), 10);
   const log: StrategyLog = {
     taxYear,
-    s0_efts: "skipped",
-    s0b_teos: "skipped",
-    s1_s3_xml: "skipped",
-    s2_pp_redirect: "skipped",
-    s2_url: null,
-    s3_pdf: "skipped",
+    ppObjectId: f.object_id ?? "(none)",
+    s3Attempts: [],
     result: "none",
     recordCount: 0,
   };
 
-  let objectId = (f.object_id && /^\d{14,}$/.test(f.object_id)) ? f.object_id : null;
+  // Collect all candidate URLs: ProPublica objectId (if present) first, then path-derived
+  const candidates: string[] = [];
 
-  // Strategy 0: IRS EFTS to find real objectId
-  if (!objectId) {
-    const efts = await findObjectIdViaEFTS(ein, taxYear);
-    log.s0_efts = efts.detail;
-    if (efts.objectId) objectId = efts.objectId;
-  } else {
-    log.s0_efts = `skipped (pp has ${objectId})`;
+  if (f.object_id && /^\d{14,}$/.test(f.object_id)) {
+    candidates.push(`${S3_BASE}/${f.object_id}_public.xml`);
   }
 
-  // Strategy 0b: IRS TEOS fallback
-  if (!objectId) {
-    const teos = await findObjectIdViaIRSTEOS(ein);
-    log.s0b_teos = teos.detail;
-    if (teos.objectId) objectId = teos.objectId;
-  } else {
-    log.s0b_teos = "skipped";
-  }
-
-  // Strategy 1: IRS S3 XML
-  if (objectId) {
-    const r = await fetchScheduleJ(objectId, taxYear);
-    log.s1_s3_xml = r ? `ok (${r.records.length} records)` : "404/empty";
-    if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
-  } else {
-    log.s1_s3_xml = "no objectId";
-  }
-
-  // Strategy 2: Capture ProPublica redirect destination — if PP redirects to S3
   if (f.pdf_url) {
-    const xmlUrl = xmlUrlFromPdf(f.pdf_url) ?? f.pdf_url;
-    log.s2_url = xmlUrl;
-    try {
-      const res = await fetch(xmlUrl, {
-        redirect: "manual",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-          "Accept": "application/xml, text/xml, */*",
-          "Referer": "https://projects.propublica.org/nonprofits/",
-        },
-      });
-      const location = res.headers.get("location");
-      log.s2_pp_redirect = `HTTP ${res.status}${location ? ` → ${location.slice(0, 100)}` : ""}`;
-
-      if (location && location.includes("amazonaws.com")) {
-        const r = await fetchScheduleJFromXmlUrl(location, taxYear);
-        log.s2_pp_redirect += r ? ` parsed (${r.records.length})` : " → 0 parsed";
-        if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
-      }
-    } catch (e) {
-      log.s2_pp_redirect = `error: ${String(e).slice(0, 80)}`;
+    for (const c of buildS3Candidates(f.pdf_url)) {
+      if (!candidates.includes(c)) candidates.push(c);
     }
   }
 
-  // Strategy 3: PDF parsing (only for non-ProPublica URLs)
-  if (f.pdf_url && !f.pdf_url.includes("projects.propublica.org")) {
+  for (const url of candidates) {
     try {
-      const records = await extractOfficersFromPdf(f.pdf_url);
-      log.s3_pdf = `parsed (${records.length} records)`;
-      if (records.length > 0) {
-        const r: ScheduleJResult = { taxYear, objectId: "pdf", records };
-        log.result = "found"; log.recordCount = records.length;
-        return { result: r, log };
+      const res = await fetch(url, {
+        next: { revalidate: 86400 },
+        headers: { Accept: "application/xml, text/xml, */*" },
+      });
+      const statusStr = `HTTP ${res.status}`;
+
+      if (res.ok) {
+        const r = await fetchScheduleJFromXmlUrl(url, taxYear);
+        const detail = r
+          ? `${statusStr} → ${r.records.length} records`
+          : `${statusStr} → 0 records parsed`;
+        log.s3Attempts.push({ url, status: detail });
+        if (r && r.records.length > 0) {
+          log.result = "found";
+          log.recordCount = r.records.length;
+          return { result: r, log };
+        }
+      } else {
+        if (debug) log.s3Attempts.push({ url, status: statusStr });
       }
     } catch (e) {
-      log.s3_pdf = `error: ${String(e).slice(0, 120)}`;
+      if (debug)
+        log.s3Attempts.push({ url, status: `error: ${String(e).slice(0, 60)}` });
     }
-  } else if (f.pdf_url) {
-    log.s3_pdf = "skipped (ProPublica proxy)";
   }
 
   return { result: null, log };
@@ -239,9 +146,8 @@ export async function GET(
     const filings = await getPPFilings(ein);
     if (!filings.length) return NextResponse.json({ ein, years: [] });
 
-    // Check up to 6 filings — older ones may have IRS objectIds directly
     const outcomes = await Promise.all(
-      filings.slice(0, 6).map((f) => resolveScheduleJ(f, ein, debug))
+      filings.slice(0, 6).map((f) => resolveScheduleJ(f, debug))
     );
 
     const years = outcomes
@@ -250,7 +156,11 @@ export async function GET(
       .sort((a, b) => b.taxYear - a.taxYear);
 
     if (debug) {
-      return NextResponse.json({ ein, years, debugLogs: outcomes.map((o) => o.log) });
+      return NextResponse.json({
+        ein,
+        years,
+        debugLogs: outcomes.map((o) => o.log),
+      });
     }
 
     return NextResponse.json({ ein, years });
