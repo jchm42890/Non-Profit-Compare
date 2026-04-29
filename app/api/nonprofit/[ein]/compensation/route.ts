@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { fetchScheduleJFromXmlUrl, type ScheduleJResult } from "@/lib/irs/fetch-schedule-j";
 
 export const dynamic = "force-dynamic";
+// Allow up to 30s on Vercel Pro; Hobby plan caps at 10s regardless
+export const maxDuration = 30;
 
 const S3_BASE = "https://s3.amazonaws.com/irs-form-990";
 
@@ -18,62 +20,67 @@ async function getPPFilings(ein: string): Promise<PPFiling[]> {
     "https://projects.propublica.org/nonprofits/api/v2";
   const res = await fetch(`${base}/organizations/${normalized}.json`, {
     next: { revalidate: 3600 },
+    signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) return [];
   const data = (await res.json()) as { filings_with_data?: PPFiling[] };
   return data.filings_with_data ?? [];
 }
 
-// Build every plausible IRS S3 URL from a ProPublica pdf_url.
-// ProPublica's path parameter encodes where they stored the filing:
-//   - "IRS/954016653_202306_990_2024042322369843.xml"   (newer: may be in IRS S3 root or IRS/ prefix)
-//   - "04_2021_prefixes_95-99/954016653_202006_990_2021040617897708.xml"  (older: ProPublica batch)
-// We try: full path as S3 key, filename-only as S3 key, _public.xml variants, and
-// the ProPublica objectId format {YYYYMMDD}{8-digit-seq}_public.xml.
-function buildS3Candidates(pdfUrl: string): string[] {
+// Returns the 2–3 most likely IRS S3 URLs for a filing.
+// Priority: explicit objectId → filename-only _public.xml → full path.
+function buildS3Candidates(f: PPFiling): string[] {
   const candidates: string[] = [];
+
+  // 1. ProPublica-provided objectId (most reliable when present)
+  if (f.object_id && /^\d{14,}$/.test(f.object_id)) {
+    candidates.push(`${S3_BASE}/${f.object_id}_public.xml`);
+    return candidates; // objectId is definitive — no need to try others
+  }
+
+  if (!f.pdf_url) return candidates;
+
   try {
-    const u = new URL(pdfUrl);
+    const u = new URL(f.pdf_url);
     const rawPath = decodeURIComponent(u.searchParams.get("path") ?? "");
-    // Normalise to .xml (could be .pdf)
     const xmlPath = rawPath.replace(/\.pdf$/i, ".xml");
     const filename = xmlPath.split("/").pop() ?? "";
-
     if (!filename) return candidates;
 
-    // Full ProPublica path as S3 key (works if IRS S3 mirrors this structure)
-    candidates.push(`${S3_BASE}/${xmlPath}`);
-    candidates.push(`${S3_BASE}/${xmlPath.replace(/\.xml$/, "_public.xml")}`);
-
-    // Filename-only (no subdirectory)
-    candidates.push(`${S3_BASE}/${filename}`);
+    // 2. Filename-only as S3 key with _public suffix (most common IRS format)
     candidates.push(`${S3_BASE}/${filename.replace(/\.xml$/, "_public.xml")}`);
-
-    // ProPublica's internal ID is the last _-segment: e.g. "2024042322369843"
-    // The IRS objectId for the same filing starts with the same date (YYYYMMDD)
-    // but may differ in the trailing sequence. Try common IRS sequence suffixes:
-    const nameNoExt = filename.replace(/\.xml$/, "");
-    const segments = nameNoExt.split("_");
-    const ppId = segments[segments.length - 1]; // e.g. "2024042322369843"
-    if (/^\d{16}$/.test(ppId)) {
-      // IRS objectIds we've seen are 15 digits: YYYYMMDD + 7 digits
-      // ProPublica's are 16 digits: YYYYMMDD + 8 digits
-      // Try dropping the 9th digit (index 8) — first digit of the sequence
-      const datepart = ppId.slice(0, 8); // "20240423"
-      const seq8 = ppId.slice(8);        // "22369843"
-      // Common IRS sequences seen in public data end with 9349303
-      for (const suffix of ["9349303", "0000001", seq8.slice(1)]) {
-        candidates.push(`${S3_BASE}/${datepart}${suffix}_public.xml`);
-      }
+    // 3. Filename-only without _public
+    candidates.push(`${S3_BASE}/${filename}`);
+    // 4. Full ProPublica path (in case IRS mirrors it)
+    if (xmlPath.includes("/")) {
+      candidates.push(`${S3_BASE}/${xmlPath}`);
     }
   } catch {}
+
   return candidates;
+}
+
+async function tryS3Url(
+  url: string,
+  taxYear: number
+): Promise<ScheduleJResult | null> {
+  try {
+    const res = await fetch(url, {
+      next: { revalidate: 86400 },
+      signal: AbortSignal.timeout(4000),
+      headers: { Accept: "application/xml, text/xml, */*" },
+    });
+    if (!res.ok) return null;
+    return await fetchScheduleJFromXmlUrl(url, taxYear);
+  } catch {
+    return null;
+  }
 }
 
 interface StrategyLog {
   taxYear: number;
   ppObjectId: string;
-  s3Attempts: { url: string; status: string }[];
+  candidates: string[];
   result: "found" | "none";
   recordCount: number;
 }
@@ -83,52 +90,25 @@ async function resolveScheduleJ(
   debug: boolean
 ): Promise<{ result: ScheduleJResult | null; log: StrategyLog }> {
   const taxYear = parseInt(String(f.tax_prd_yr), 10);
+  const candidates = buildS3Candidates(f);
   const log: StrategyLog = {
     taxYear,
     ppObjectId: f.object_id ?? "(none)",
-    s3Attempts: [],
+    candidates: debug ? candidates : [],
     result: "none",
     recordCount: 0,
   };
 
-  // Collect all candidate URLs: ProPublica objectId (if present) first, then path-derived
-  const candidates: string[] = [];
+  // Try candidates in parallel — fast-fail on first success
+  const results = await Promise.allSettled(
+    candidates.map((url) => tryS3Url(url, taxYear))
+  );
 
-  if (f.object_id && /^\d{14,}$/.test(f.object_id)) {
-    candidates.push(`${S3_BASE}/${f.object_id}_public.xml`);
-  }
-
-  if (f.pdf_url) {
-    for (const c of buildS3Candidates(f.pdf_url)) {
-      if (!candidates.includes(c)) candidates.push(c);
-    }
-  }
-
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url, {
-        next: { revalidate: 86400 },
-        headers: { Accept: "application/xml, text/xml, */*" },
-      });
-      const statusStr = `HTTP ${res.status}`;
-
-      if (res.ok) {
-        const r = await fetchScheduleJFromXmlUrl(url, taxYear);
-        const detail = r
-          ? `${statusStr} → ${r.records.length} records`
-          : `${statusStr} → 0 records parsed`;
-        log.s3Attempts.push({ url, status: detail });
-        if (r && r.records.length > 0) {
-          log.result = "found";
-          log.recordCount = r.records.length;
-          return { result: r, log };
-        }
-      } else {
-        if (debug) log.s3Attempts.push({ url, status: statusStr });
-      }
-    } catch (e) {
-      if (debug)
-        log.s3Attempts.push({ url, status: `error: ${String(e).slice(0, 60)}` });
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value && r.value.records.length > 0) {
+      log.result = "found";
+      log.recordCount = r.value.records.length;
+      return { result: r.value, log };
     }
   }
 
@@ -147,7 +127,7 @@ export async function GET(
     if (!filings.length) return NextResponse.json({ ein, years: [] });
 
     const outcomes = await Promise.all(
-      filings.slice(0, 6).map((f) => resolveScheduleJ(f, debug))
+      filings.slice(0, 5).map((f) => resolveScheduleJ(f, debug))
     );
 
     const years = outcomes
