@@ -175,22 +175,45 @@ export async function fetchScheduleJ(
 ): Promise<ScheduleJResult | null> {
   const xml = await tryFetchXml(objectId);
   if (!xml) return null;
+  return parseXml(xml, objectId, taxYear);
+}
 
+// Fetch XML from any arbitrary URL (e.g. ProPublica's own hosting)
+export async function fetchScheduleJFromXmlUrl(
+  xmlUrl: string,
+  taxYear: number
+): Promise<ScheduleJResult | null> {
+  try {
+    const res = await fetch(xmlUrl, {
+      next: { revalidate: 86400 },
+      headers: { Accept: "application/xml, text/xml, */*" },
+    });
+    if (!res.ok) return null;
+    const xml = await res.text();
+    return parseXml(xml, xmlUrl, taxYear);
+  } catch {
+    return null;
+  }
+}
+
+function parseXml(
+  xml: string,
+  sourceId: string,
+  taxYear: number
+): ScheduleJResult | null {
   try {
     const doc = parser.parse(xml) as Record<string, unknown>;
 
-    // Find IRS990ScheduleJ anywhere in the tree
     const schedJ = deepFind(doc, "IRS990ScheduleJ") as Record<string, unknown> | null;
     if (schedJ) {
       const records = extractScheduleJRecords(schedJ);
-      if (records.length) return { taxYear, objectId, records };
+      if (records.length) return { taxYear, objectId: sourceId, records };
     }
 
-    // Fallback to Part VII of the core 990
     const return990 = deepFind(doc, "IRS990") as Record<string, unknown> | null;
     if (return990) {
       const records = extractPartVII(return990);
-      if (records.length) return { taxYear, objectId, records };
+      if (records.length) return { taxYear, objectId: sourceId, records };
     }
 
     return null;
