@@ -44,13 +44,24 @@ export function CompensationTable({ ein }: Props) {
   }
 
   if (!data?.years?.length) {
+    const ppUrl = `https://projects.propublica.org/nonprofits/organizations/${ein.replace(/-/g, "")}`;
     return (
       <div className="rounded-lg border bg-card p-6">
         <h3 className="font-semibold text-lg mb-2">Executive Compensation</h3>
-        <p className="text-sm text-muted-foreground">
-          Officer compensation detail is not yet available for this organization.
-          The IRS public dataset typically lags 1–2 years for recent filings.
+        <p className="text-sm text-muted-foreground mb-2">
+          IRS e-file records are not yet publicly available for this organization.
+          This is common for organizations whose most recent filings are still within
+          the IRS dataset&apos;s 12–24 month publication lag, or for those that filed
+          paper returns prior to the 2020 e-file mandate.
         </p>
+        <a
+          href={ppUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm text-primary underline underline-offset-2"
+        >
+          View filings on ProPublica Nonprofit Explorer →
+        </a>
       </div>
     );
   }
