@@ -2,17 +2,6 @@ import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-function objectIdFromPdfUrl(pdfUrl: string): string | null {
-  try {
-    const decoded = decodeURIComponent(new URL(pdfUrl).searchParams.get("path") ?? "");
-    const filename = decoded.split("/").pop()?.replace(".pdf", "") ?? "";
-    const segments = filename.split("_");
-    const candidate = segments[segments.length - 1];
-    if (/^\d{10,}$/.test(candidate)) return candidate;
-  } catch {}
-  return null;
-}
-
 export async function GET(
   _req: Request,
   { params }: { params: { ein: string } }
@@ -23,43 +12,65 @@ export async function GET(
     process.env.PROPUBLICA_API_BASE ??
     "https://projects.propublica.org/nonprofits/api/v2";
 
+  // 1. ProPublica filing list
   const ppRes = await fetch(`${base}/organizations/${normalized}.json`, { cache: "no-store" });
   const ppData = await ppRes.json();
-  const filings = (ppData.filings_with_data ?? []).slice(0, 3);
-  const first = filings[0];
+  const firstFiling = (ppData.filings_with_data ?? [])[0];
+  const taxYear: number = parseInt(String(firstFiling?.tax_prd_yr ?? "2023"), 10);
 
-  const directObjectId = first?.object_id && /^\d+$/.test(first.object_id) ? first.object_id : null;
-  const pdfObjectId = first?.pdf_url ? objectIdFromPdfUrl(first.pdf_url) : null;
-  const resolvedObjectId = directObjectId ?? pdfObjectId;
-
-  let xmlPreview: string | null = null;
-  let xmlError: string | null = null;
-  let s3Url: string | null = null;
-
-  if (resolvedObjectId) {
-    s3Url = `https://s3.amazonaws.com/irs-form-990/${resolvedObjectId}_public.xml`;
-    try {
-      const xmlRes = await fetch(s3Url, { cache: "no-store" });
-      if (xmlRes.ok) {
-        const text = await xmlRes.text();
-        xmlPreview = text.slice(0, 3000);
-      } else {
-        xmlError = `S3 returned ${xmlRes.status}`;
-      }
-    } catch (e) {
-      xmlError = String(e);
-    }
+  // 2. IRS EFTS full-text search (the authoritative object_id source)
+  let eftsResult: unknown = null;
+  let eftsError: string | null = null;
+  try {
+    const eftsUrl = `https://efts.irs.gov/LATEST/search-index?q=%22${normalized}%22&dateRange=custom&startDate=${taxYear - 1}-01-01&endDate=${taxYear + 2}-12-31&forms=990,990EZ,990PF`;
+    const eftsRes = await fetch(eftsUrl, { cache: "no-store", headers: { Accept: "application/json" } });
+    eftsResult = eftsRes.ok ? await eftsRes.json() : `HTTP ${eftsRes.status}`;
+  } catch (e) {
+    eftsError = String(e);
   }
+
+  // 3. IRS annual index file for the likely filing year
+  const indexYear = taxYear + 1; // e.g. tax year 2023 → filed in 2024 index
+  let indexMatch: unknown = null;
+  let indexError: string | null = null;
+  try {
+    const idxUrl = `https://s3.amazonaws.com/irs-form-990/index_${indexYear}.json`;
+    const idxRes = await fetch(idxUrl, { cache: "no-store" });
+    if (idxRes.ok) {
+      const idxData = await idxRes.json() as { Filings?: { EIN: string; TaxPeriod: string; ObjectId?: string; URL?: string }[] };
+      indexMatch = idxData.Filings?.find(
+        (f) => f.EIN === normalized && f.TaxPeriod?.startsWith(String(taxYear))
+      ) ?? null;
+    } else {
+      indexError = `index HTTP ${idxRes.status}`;
+    }
+  } catch (e) {
+    indexError = String(e);
+  }
+
+  // 4. Try direct S3 XML with the pdf_url-derived ID anyway (for reference)
+  const pdfId = firstFiling?.pdf_url
+    ? (() => {
+        try {
+          const decoded = decodeURIComponent(new URL(firstFiling.pdf_url).searchParams.get("path") ?? "");
+          const segs = decoded.split("/").pop()?.replace(".pdf", "").split("_") ?? [];
+          return segs[segs.length - 1];
+        } catch { return null; }
+      })()
+    : null;
 
   return NextResponse.json({
     ein,
-    filingCount: filings.length,
-    firstFiling: first ? { tax_prd_yr: first.tax_prd_yr, formtype: first.formtype, object_id: first.object_id ?? "MISSING", pdf_url: first.pdf_url ?? null } : null,
-    directObjectId,
-    pdfObjectId,
-    resolvedObjectId,
-    s3Url,
-    xmlError,
-    xmlPreview,
+    taxYear,
+    firstFiling: firstFiling
+      ? { tax_prd_yr: firstFiling.tax_prd_yr, object_id: firstFiling.object_id ?? "MISSING", pdf_url: firstFiling.pdf_url }
+      : null,
+    pdfDerivedId: pdfId,
+    eftsError,
+    eftsHitCount: (eftsResult as { hits?: { hits?: unknown[] } })?.hits?.hits?.length ?? 0,
+    eftsFirstHit: (eftsResult as { hits?: { hits?: { _id: string; _source: unknown }[] } })?.hits?.hits?.[0] ?? null,
+    indexYear,
+    indexError,
+    indexMatch,
   });
 }
