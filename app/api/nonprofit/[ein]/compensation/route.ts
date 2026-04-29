@@ -22,21 +22,11 @@ function xmlUrlFromPdf(pdfUrl: string): string | null {
   }
 }
 
+// Only use the ProPublica-provided object_id (already the IRS key).
+// The last path segment from pdf_url is ProPublica's internal ID, not the IRS
+// objectId — do NOT use it for S3 lookups.
 function extractObjectId(f: PPFiling): string | null {
   if (f.object_id && /^\d{14,}$/.test(f.object_id)) return f.object_id;
-  // ProPublica path: "IRS/954016653_202306_990_2024042322369843.pdf"
-  // The IRS object ID is the last underscore-segment before the extension
-  if (f.pdf_url) {
-    try {
-      const u = new URL(f.pdf_url);
-      const path = decodeURIComponent(u.searchParams.get("path") ?? "");
-      const filename = (path.split("/").pop() ?? "").replace(/\.(pdf|xml)$/i, "");
-      const segments = filename.split("_");
-      for (let i = segments.length - 1; i >= 0; i--) {
-        if (/^\d{14,}$/.test(segments[i])) return segments[i];
-      }
-    } catch {}
-  }
   return null;
 }
 
@@ -49,8 +39,41 @@ async function getPPFilings(ein: string): Promise<PPFiling[]> {
   return data.filings_with_data ?? [];
 }
 
+// IRS EFTS full-text search returns the real IRS objectId for any e-filed 990.
+// Returns the objectId string if found, or null on any failure.
+async function findObjectIdViaEFTS(ein: string, taxYear: number): Promise<string | null> {
+  try {
+    const normalized = ein.replace(/-/g, "");
+    // Tax period ending date is typically June 30 for fiscal-year orgs, Dec 31 for calendar-year
+    const url =
+      `https://efts.irs.gov/LATEST/search-engines/irs_990_search_engine_data/search` +
+      `?q=&ein=${normalized}&dateRange=custom` +
+      `&startDate=${taxYear}-01-01&endDate=${taxYear + 1}-06-30`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(7000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; nonprofit-research/1.0)",
+        "Accept": "application/json",
+      },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, unknown>;
+    const hits = ((data.hits as Record<string, unknown>)?.hits as unknown[]) ?? [];
+    for (const h of hits) {
+      const hit = h as Record<string, unknown>;
+      const src = hit._source as Record<string, unknown> | undefined;
+      const id = String(src?.ObjectId ?? src?.object_id ?? hit._id ?? "");
+      if (/^\d{14,}$/.test(id)) return id;
+    }
+  } catch {
+    // EFTS unreachable or timed out — proceed to next strategy
+  }
+  return null;
+}
+
 interface StrategyLog {
   taxYear: number;
+  s0_efts: string;
   s1_s3_xml: string;
   s2_pp_xml: string;
   s2_url: string | null;
@@ -61,11 +84,13 @@ interface StrategyLog {
 
 async function resolveScheduleJ(
   f: PPFiling,
+  ein: string,
   debug: boolean
 ): Promise<{ result: ScheduleJResult | null; log: StrategyLog }> {
   const taxYear = parseInt(String(f.tax_prd_yr), 10);
   const log: StrategyLog = {
     taxYear,
+    s0_efts: "skipped",
     s1_s3_xml: "skipped",
     s2_pp_xml: "skipped",
     s2_url: null,
@@ -74,8 +99,22 @@ async function resolveScheduleJ(
     recordCount: 0,
   };
 
-  // Strategy 1: IRS S3 XML
-  const objectId = extractObjectId(f);
+  let objectId = extractObjectId(f);
+
+  // Strategy 0: IRS EFTS lookup to find objectId when ProPublica doesn't provide it
+  if (!objectId) {
+    const eftsId = await findObjectIdViaEFTS(ein, taxYear);
+    if (eftsId) {
+      objectId = eftsId;
+      log.s0_efts = `found: ${eftsId}`;
+    } else {
+      log.s0_efts = "not found";
+    }
+  } else {
+    log.s0_efts = `skipped (have objectId: ${objectId})`;
+  }
+
+  // Strategy 1: IRS S3 XML (requires a real IRS objectId)
   if (objectId) {
     const r = await fetchScheduleJ(objectId, taxYear);
     log.s1_s3_xml = r ? `ok (${r.records.length} records)` : "404/empty";
@@ -84,34 +123,30 @@ async function resolveScheduleJ(
     log.s1_s3_xml = "no objectId";
   }
 
-  // Strategy 2: IRS S3 XML via full-path filename (ProPublica proxy always 403 server-side)
-  // ProPublica path encodes the full filename; try it as a bare S3 key too
+  // Strategy 2: Try fetching the ProPublica XML URL with redirect capture
+  // ProPublica proxies to an S3 URL; with redirect:manual we can see the real destination
   if (f.pdf_url) {
     const xmlUrl = xmlUrlFromPdf(f.pdf_url);
-    log.s2_url = xmlUrl;
-    if (xmlUrl) {
-      // Extract the bare filename from the path and try IRS S3 directly
-      try {
-        const u = new URL(xmlUrl);
-        const path = decodeURIComponent(u.searchParams.get("path") ?? "");
-        const filename = path.split("/").pop() ?? "";
-        if (filename.endsWith(".xml")) {
-          const directS3 = `https://s3.amazonaws.com/irs-form-990/${filename}`;
-          const res = await fetch(directS3, {
-            next: { revalidate: 86400 },
-            headers: { Accept: "application/xml, text/xml, */*" },
-          });
-          log.s2_pp_xml = `direct-S3 HTTP ${res.status}`;
-          if (res.ok) {
-            const xml = await res.text();
-            const r = await fetchScheduleJFromXmlUrl(directS3, taxYear);
-            log.s2_pp_xml += r ? ` → ${r.records.length} records` : " → 0 parsed";
-            if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
-          }
-        }
-      } catch (e) {
-        log.s2_pp_xml = `error: ${String(e).slice(0, 80)}`;
+    log.s2_url = xmlUrl ?? f.pdf_url;
+    const targetUrl = xmlUrl ?? f.pdf_url;
+    try {
+      const headRes = await fetch(targetUrl, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept": "application/xml, text/xml, */*",
+          "Referer": "https://projects.propublica.org/nonprofits/",
+        },
+      });
+      const location = headRes.headers.get("location");
+      log.s2_pp_xml = `HTTP ${headRes.status}${location ? ` → ${location.slice(0, 80)}` : ""}`;
+      if (location && (location.includes("s3.amazonaws.com") || location.includes("amazonaws.com"))) {
+        const r = await fetchScheduleJFromXmlUrl(location, taxYear);
+        log.s2_pp_xml += r ? ` parsed (${r.records.length} records)` : " → 0 parsed";
+        if (r) { log.result = "found"; log.recordCount = r.records.length; return { result: r, log }; }
       }
+    } catch (e) {
+      log.s2_pp_xml = `error: ${String(e).slice(0, 80)}`;
     }
   }
 
@@ -129,7 +164,7 @@ async function resolveScheduleJ(
       log.s3_pdf = `error: ${String(e).slice(0, 120)}`;
     }
   } else if (f.pdf_url) {
-    log.s3_pdf = "skipped (ProPublica proxy 403)";
+    log.s3_pdf = "skipped (ProPublica proxy)";
   }
 
   return { result: null, log };
@@ -146,8 +181,9 @@ export async function GET(
     const filings = await getPPFilings(ein);
     if (!filings.length) return NextResponse.json({ ein, years: [] });
 
+    // Try up to 6 filings — older ones (2019-2021) have IRS objectIds directly from ProPublica
     const outcomes = await Promise.all(
-      filings.slice(0, 3).map((f) => resolveScheduleJ(f, debug))
+      filings.slice(0, 6).map((f) => resolveScheduleJ(f, ein, debug))
     );
 
     const years = outcomes
