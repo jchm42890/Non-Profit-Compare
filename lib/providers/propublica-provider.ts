@@ -170,7 +170,11 @@ async function ppFetch<T>(path: string): Promise<T> {
     next: { revalidate: 3600 },
     signal: AbortSignal.timeout(10000),
   });
-  if (!res.ok) throw new Error(`ProPublica API error: ${res.status} ${path}`);
+  if (!res.ok) {
+    // ProPublica returns 404 (not an empty array) when a search yields no results
+    if (res.status === 404) return { organizations: [], total_results: 0 } as unknown as T;
+    throw new Error(`ProPublica API error: ${res.status} ${path}`);
+  }
   return res.json() as Promise<T>;
 }
 

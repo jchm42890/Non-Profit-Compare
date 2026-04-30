@@ -25,6 +25,10 @@ export async function GET(req: NextRequest) {
     ...(category ? { nteeCategory: category } : {}),
   };
 
-  const result = await dataProvider.searchOrganizations(q, filters, page, pageSize);
-  return NextResponse.json(result);
+  try {
+    const result = await dataProvider.searchOrganizations(q, filters, page, pageSize);
+    return NextResponse.json(result);
+  } catch {
+    return NextResponse.json({ organizations: [], total: 0, page, pageSize });
+  }
 }
