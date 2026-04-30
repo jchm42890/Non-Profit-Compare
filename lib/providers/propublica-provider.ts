@@ -167,7 +167,8 @@ function buildOrgWithFilings(
 async function ppFetch<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { Accept: "application/json" },
-    next: { revalidate: 3600 }, // 1-hour Next.js cache
+    next: { revalidate: 3600 },
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) throw new Error(`ProPublica API error: ${res.status} ${path}`);
   return res.json() as Promise<T>;
@@ -239,6 +240,7 @@ export class ProPublicaProvider implements NonprofitDataProvider {
     _strategy: SimilarityStrategy = "combined",
     limit = 6
   ): Promise<SimilarOrganization[]> {
+    try {
     const target = await this.getOrganizationByEin(ein);
     if (!target) return [];
 
@@ -270,6 +272,9 @@ export class ProPublicaProvider implements NonprofitDataProvider {
       .sort((a, b) => b._score - a._score)
       .slice(0, limit)
       .map(({ _score: _, ...rest }) => rest);
+    } catch {
+      return [];
+    }
   }
 
   async getLocalOrganizations(
@@ -277,27 +282,30 @@ export class ProPublicaProvider implements NonprofitDataProvider {
     filters: Pick<SearchFilters, "nteeCode" | "nteeCategory"> = {},
     limit = 10
   ): Promise<Organization[]> {
-    const params = new URLSearchParams();
-    // Search by city name as query since ProPublica has no city filter
-    if (location.city) params.set("q", location.city);
-    if (location.state) params.set("state[id]", location.state.toUpperCase());
-    if (filters.nteeCode) {
-      const letter = filters.nteeCode.charAt(0).toUpperCase();
-      const id = NTEE_TO_ID[letter];
-      if (id) params.set("ntee[id]", String(id));
+    try {
+      const params = new URLSearchParams();
+      if (location.city) params.set("q", location.city);
+      if (location.state) params.set("state[id]", location.state.toUpperCase());
+      if (filters.nteeCode) {
+        const letter = filters.nteeCode.charAt(0).toUpperCase();
+        const id = NTEE_TO_ID[letter];
+        if (id) params.set("ntee[id]", String(id));
+      }
+
+      const data = await ppFetch<PPSearchResponse>(
+        `/search.json?${params.toString()}`
+      );
+
+      return (data.organizations ?? [])
+        .filter(
+          (o) =>
+            !location.city ||
+            o.city?.toLowerCase().includes(location.city.toLowerCase())
+        )
+        .slice(0, limit)
+        .map(mapOrg);
+    } catch {
+      return [];
     }
-
-    const data = await ppFetch<PPSearchResponse>(
-      `/search.json?${params.toString()}`
-    );
-
-    return (data.organizations ?? [])
-      .filter(
-        (o) =>
-          !location.city ||
-          o.city?.toLowerCase().includes(location.city.toLowerCase())
-      )
-      .slice(0, limit)
-      .map(mapOrg);
   }
 }

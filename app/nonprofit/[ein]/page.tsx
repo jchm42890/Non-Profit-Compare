@@ -27,17 +27,13 @@ export async function generateMetadata({ params }: NonprofitPageProps) {
 }
 
 export default async function NonprofitPage({ params }: NonprofitPageProps) {
-  const [org, similar, local] = await Promise.all([
-    dataProvider.getOrganizationByEin(params.ein),
-    dataProvider.getSimilarOrganizations(params.ein, "combined", 6),
-    (async () => {
-      const o = await dataProvider.getOrganizationByEin(params.ein);
-      if (!o) return [];
-      return dataProvider.getLocalOrganizations({ city: o.city, state: o.state }, {}, 6);
-    })(),
-  ]);
-
+  const org = await dataProvider.getOrganizationByEin(params.ein);
   if (!org) notFound();
+
+  const [similar, local] = await Promise.all([
+    dataProvider.getSimilarOrganizations(params.ein, "combined", 6).catch(() => []),
+    dataProvider.getLocalOrganizations({ city: org.city, state: org.state }, {}, 6).catch(() => []),
+  ]);
 
   const latestFiling = org.latestFiling;
   const latestMetrics = org.latestMetrics;
