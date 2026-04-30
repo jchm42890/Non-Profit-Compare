@@ -18,12 +18,16 @@ interface NonprofitPageProps {
 }
 
 export async function generateMetadata({ params }: NonprofitPageProps) {
-  const org = await dataProvider.getOrganizationByEin(params.ein);
-  if (!org) return { title: "Not found" };
-  return {
-    title: `${org.name} — Nonprofit Compare`,
-    description: org.mission ?? `Form 990 data for ${org.name}`,
-  };
+  try {
+    const org = await dataProvider.getOrganizationByEin(params.ein);
+    if (!org) return { title: "Not found" };
+    return {
+      title: `${org.name} — Nonprofit Compare`,
+      description: org.mission ?? `Form 990 data for ${org.name}`,
+    };
+  } catch {
+    return { title: "Nonprofit Compare" };
+  }
 }
 
 export default async function NonprofitPage({ params }: NonprofitPageProps) {
